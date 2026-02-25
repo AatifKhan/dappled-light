@@ -9,17 +9,322 @@ const App = () => {
   const [sunAngle, setSunAngle] = useState(0.5); // 0 = East, 0.5 = Noon, 1 = West
   const [isNight, setIsNight] = useState(false);
   const [showUI, setShowUI] = useState(true);
+  const [isSoundOn, setIsSoundOn] = useState(false);
   
   const windRef = useRef(1.5);
   const sunAngleRef = useRef(0.5);
+  const isNightRef = useRef(false);
+  const isSoundOnRef = useRef(false);
   const sunLightRef = useRef(null);
   const ambientLightRef = useRef(null);
   const sceneRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const windGainRef = useRef(null);
+  const masterGainRef = useRef(null);
+  const highPassRef = useRef(null);
+  const lowPassRef = useRef(null);
+  const noiseSourceRef = useRef(null);
+  const lfoRef = useRef(null);
+  const lfoDepthRef = useRef(null);
+  const birdGainRef = useRef(null);
+  const birdTimerRef = useRef(null);
+  const suspendTimeoutRef = useRef(null);
+
+  const getBirdProfile = (nightMode, angle) => {
+    if (nightMode || angle < 0.08 || angle > 0.92) {
+      return { activity: 0.03, minDelay: 9000, maxDelay: 16000, mix: [0.2, 0.1, 0.7] };
+    }
+    if (angle < 0.3) {
+      return { activity: 0.95, minDelay: 1400, maxDelay: 3400, mix: [0.5, 0.35, 0.15] };
+    }
+    if (angle < 0.72) {
+      return { activity: 0.6, minDelay: 2500, maxDelay: 5200, mix: [0.35, 0.45, 0.2] };
+    }
+    return { activity: 0.3, minDelay: 3600, maxDelay: 7000, mix: [0.25, 0.25, 0.5] };
+  };
+
+  const weightedSpecies = (mix) => {
+    const r = Math.random();
+    if (r < mix[0]) return 'warbler';
+    if (r < mix[0] + mix[1]) return 'sparrow';
+    return 'dove';
+  };
+
+  const playNote = (ctx, destination, startAt, note) => {
+    const osc = ctx.createOscillator();
+    const toneFilter = ctx.createBiquadFilter();
+    const gain = ctx.createGain();
+
+    osc.type = note.type;
+    osc.frequency.setValueAtTime(note.freq, startAt);
+    if (note.glideTo) {
+      osc.frequency.exponentialRampToValueAtTime(note.glideTo, startAt + note.duration);
+    }
+
+    toneFilter.type = 'bandpass';
+    toneFilter.frequency.value = note.filter;
+    toneFilter.Q.value = 4.5;
+
+    gain.gain.setValueAtTime(0.0001, startAt);
+    gain.gain.exponentialRampToValueAtTime(note.peak, startAt + note.attack);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + note.duration);
+
+    osc.connect(toneFilter);
+    toneFilter.connect(gain);
+    gain.connect(destination);
+
+    osc.start(startAt);
+    osc.stop(startAt + note.duration + 0.02);
+    osc.onended = () => {
+      osc.disconnect();
+      toneFilter.disconnect();
+      gain.disconnect();
+    };
+  };
+
+  const playBirdCall = (ctx, windValue, profile) => {
+    const birdGain = birdGainRef.current;
+    if (!birdGain) return;
+    const species = weightedSpecies(profile.mix);
+    const now = ctx.currentTime + 0.02;
+    const breezeSoftener = Math.max(0.65, 1 - windValue * 0.09);
+
+    if (species === 'warbler') {
+      const base = 1700 + Math.random() * 350;
+      const sequence = [0, 0.08, 0.17, 0.28].map((offset, idx) => ({
+        start: offset,
+        freq: base * (1 + idx * 0.14),
+        glideTo: base * (1.08 + idx * 0.08),
+        duration: 0.11,
+        attack: 0.02,
+        peak: 0.08 * breezeSoftener,
+        filter: 2600,
+        type: 'triangle'
+      }));
+      sequence.forEach((note) => playNote(ctx, birdGain, now + note.start, note));
+      return;
+    }
+
+    if (species === 'sparrow') {
+      const base = 2200 + Math.random() * 500;
+      const sequence = [0, 0.06, 0.13, 0.2, 0.28].map((offset, idx) => ({
+        start: offset,
+        freq: base * (idx % 2 === 0 ? 1 : 0.9),
+        glideTo: base * (idx % 2 === 0 ? 1.04 : 0.95),
+        duration: 0.07,
+        attack: 0.01,
+        peak: 0.06 * breezeSoftener,
+        filter: 3200,
+        type: 'square'
+      }));
+      sequence.forEach((note) => playNote(ctx, birdGain, now + note.start, note));
+      return;
+    }
+
+    const base = 520 + Math.random() * 160;
+    const sequence = [0, 0.34].map((offset, idx) => ({
+      start: offset,
+      freq: base * (idx === 0 ? 1.12 : 1),
+      glideTo: base * 0.82,
+      duration: 0.38,
+      attack: 0.07,
+      peak: 0.045 * breezeSoftener,
+      filter: 860,
+      type: 'sine'
+    }));
+    sequence.forEach((note) => playNote(ctx, birdGain, now + note.start, note));
+  };
+
+  const clearBirdTimer = () => {
+    if (birdTimerRef.current) {
+      window.clearTimeout(birdTimerRef.current);
+      birdTimerRef.current = null;
+    }
+  };
+
+  const scheduleBirds = () => {
+    clearBirdTimer();
+    const ctx = audioContextRef.current;
+    const birdGain = birdGainRef.current;
+    if (!ctx || !birdGain || !isSoundOnRef.current || ctx.state !== 'running') return;
+
+    const profile = getBirdProfile(isNightRef.current, sunAngleRef.current);
+    const windValue = windRef.current;
+    const windMask = Math.max(0.45, 1 - windValue * 0.1);
+    const chirpProbability = profile.activity * windMask;
+    const now = ctx.currentTime;
+
+    birdGain.gain.setTargetAtTime(0.8 + profile.activity * 0.6, now, 0.5);
+    if (Math.random() < chirpProbability) {
+      playBirdCall(ctx, windValue, profile);
+    }
+
+    const delayRange = profile.maxDelay - profile.minDelay;
+    const nextDelay = profile.minDelay + Math.random() * delayRange;
+    birdTimerRef.current = window.setTimeout(scheduleBirds, nextDelay);
+  };
+
+  const updateWindAudio = (windValue, soundEnabled) => {
+    const ctx = audioContextRef.current;
+    const windGain = windGainRef.current;
+    const masterGain = masterGainRef.current;
+    const highPass = highPassRef.current;
+    const lowPass = lowPassRef.current;
+    if (!ctx || !windGain || !masterGain || !highPass || !lowPass) return;
+
+    const intensity = Math.min(Math.max(windValue, 0), 4);
+    const targetGain = soundEnabled ? 0.004 + intensity * 0.006 : 0.0001;
+    const targetLowPass = 900 + intensity * 260;
+    const targetHighPass = 90 + intensity * 55;
+    const now = ctx.currentTime;
+
+    windGain.gain.setTargetAtTime(targetGain, now, 0.35);
+    masterGain.gain.setTargetAtTime(soundEnabled ? 1 : 0.0001, now, 0.35);
+    lowPass.frequency.setTargetAtTime(targetLowPass, now, 0.4);
+    highPass.frequency.setTargetAtTime(targetHighPass, now, 0.4);
+  };
+
+  const initWindAudio = () => {
+    if (audioContextRef.current) return;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+
+    const ctx = new AudioCtx();
+    const bufferSize = ctx.sampleRate * 2;
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+
+    const noiseSource = ctx.createBufferSource();
+    noiseSource.buffer = buffer;
+    noiseSource.loop = true;
+
+    const highPass = ctx.createBiquadFilter();
+    highPass.type = 'highpass';
+    highPass.frequency.value = 120;
+
+    const lowPass = ctx.createBiquadFilter();
+    lowPass.type = 'lowpass';
+    lowPass.frequency.value = 1200;
+
+    const windGain = ctx.createGain();
+    windGain.gain.value = 0.0001;
+
+    const masterGain = ctx.createGain();
+    masterGain.gain.value = 0.0001;
+
+    const birdGain = ctx.createGain();
+    birdGain.gain.value = 0.8;
+
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.09;
+
+    const lfoDepth = ctx.createGain();
+    lfoDepth.gain.value = 0.004;
+
+    noiseSource.connect(highPass);
+    highPass.connect(lowPass);
+    lowPass.connect(windGain);
+    windGain.connect(masterGain);
+    birdGain.connect(masterGain);
+    masterGain.connect(ctx.destination);
+
+    lfo.connect(lfoDepth);
+    lfoDepth.connect(windGain.gain);
+
+    noiseSource.start();
+    lfo.start();
+
+    audioContextRef.current = ctx;
+    windGainRef.current = windGain;
+    masterGainRef.current = masterGain;
+    highPassRef.current = highPass;
+    lowPassRef.current = lowPass;
+    noiseSourceRef.current = noiseSource;
+    lfoRef.current = lfo;
+    lfoDepthRef.current = lfoDepth;
+    birdGainRef.current = birdGain;
+  };
+
+  const teardownWindAudio = () => {
+    clearBirdTimer();
+    if (suspendTimeoutRef.current) {
+      window.clearTimeout(suspendTimeoutRef.current);
+      suspendTimeoutRef.current = null;
+    }
+    const source = noiseSourceRef.current;
+    const lfo = lfoRef.current;
+    const ctx = audioContextRef.current;
+    if (source) source.stop();
+    if (lfo) lfo.stop();
+    if (ctx) ctx.close();
+
+    audioContextRef.current = null;
+    windGainRef.current = null;
+    masterGainRef.current = null;
+    highPassRef.current = null;
+    lowPassRef.current = null;
+    birdGainRef.current = null;
+    noiseSourceRef.current = null;
+    lfoRef.current = null;
+    lfoDepthRef.current = null;
+  };
+
+  const handleSoundToggle = async () => {
+    const next = !isSoundOn;
+    if (next) {
+      initWindAudio();
+      const ctx = audioContextRef.current;
+      if (!ctx) return;
+      if (suspendTimeoutRef.current) {
+        window.clearTimeout(suspendTimeoutRef.current);
+        suspendTimeoutRef.current = null;
+      }
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+      updateWindAudio(windRef.current, true);
+      scheduleBirds();
+    } else {
+      const ctx = audioContextRef.current;
+      if (ctx) {
+        updateWindAudio(windRef.current, false);
+        clearBirdTimer();
+        suspendTimeoutRef.current = window.setTimeout(() => {
+          if (ctx.state === 'running') {
+            ctx.suspend();
+          }
+        }, 450);
+      }
+    }
+    setIsSoundOn(next);
+  };
 
   // Sync refs for the animation loop
   useEffect(() => {
     windRef.current = wind;
   }, [wind]);
+
+  useEffect(() => {
+    isNightRef.current = isNight;
+  }, [isNight]);
+
+  useEffect(() => {
+    isSoundOnRef.current = isSoundOn;
+  }, [isSoundOn]);
+
+  useEffect(() => {
+    if (!audioContextRef.current) return;
+    updateWindAudio(wind, isSoundOn);
+  }, [wind, isSoundOn]);
+
+  useEffect(() => {
+    if (!audioContextRef.current || !isSoundOn) return;
+    scheduleBirds();
+  }, [sunAngle, isNight, wind, isSoundOn]);
 
   // Handle Day/Night transition colors
   useEffect(() => {
@@ -311,6 +616,7 @@ const App = () => {
     return () => {
       window.removeEventListener('resize', handleResize);
       cancelAnimationFrame(frameId);
+      teardownWindAudio();
       if (containerRef.current) containerRef.current.innerHTML = '';
       renderer.dispose();
       leafGeo.dispose();
@@ -390,6 +696,31 @@ const App = () => {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: '9px', fontWeight: 800, color: isNight ? '#778' : '#aaa', marginBottom: '12px', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+              Ambient Sound
+            </div>
+            <button
+              onClick={handleSoundToggle}
+              style={{
+                width: '100%',
+                padding: '10px 0',
+                borderRadius: '12px',
+                border: 'none',
+                background: isSoundOn ? (isNight ? '#fff' : '#111') : 'rgba(128,128,128,0.1)',
+                color: isSoundOn ? (isNight ? '#000' : '#fff') : (isNight ? '#778' : '#666'),
+                fontSize: '10px',
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                cursor: 'pointer',
+                transition: 'all 0.2s ease',
+                outline: 'none'
+              }}
+            >
+              {isSoundOn ? 'On' : 'Off'}
+            </button>
           </div>
 
           {/* Compass Pointer */}
